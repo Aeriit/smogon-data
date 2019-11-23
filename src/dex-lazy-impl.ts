@@ -40,12 +40,18 @@ abstract class StoreBase<T> {
 }
 
 class Transformer<Src, Dest> extends StoreBase<Dest> {
+  private sourceInnerLength = 0;
+
   constructor(
     private source: Source<Src>,
     private fn: (id: number, source: Source<Src>) => Dest,
     private cache: Dest[] = []
   ) {
     super();
+
+    for (const src of source) {
+      this.sourceInnerLength = Math.max(this.sourceInnerLength, src.length);
+    }
   }
 
   get(id: number) {
@@ -84,14 +90,47 @@ class Transformer<Src, Dest> extends StoreBase<Dest> {
     return v;
   }
 
-  *[Symbol.iterator]() {
-    // TODO: more efficient hole skipping
-    let length = 0;
-    for (const source of this.source) {
-      length = Math.max(length, source.length);
+  getSource(id: number) {
+    return this.source.map(src => src[id]);
+  }
+
+  forEachIdInSource(fn: (delta: Delta<Src>, id: number) => void) {
+    for (let i = 0; i < this.sourceInnerLength; i++) {
+      fn(this.getSource(i), i);
+    }
+  }
+
+  mapSource<DataT>(
+    srcFn: ((delta: Delta<Src>) => DataT) | ((delta: Delta<Src>, id: number) => DataT),
+    transformFn?:
+      | ((obj: Dest) => void)
+      | ((obj: Dest, id: number) => void)
+      | ((obj: Dest, id: number, data: DataT) => void)
+  ) {
+    for (let i = 0; i < this.sourceInnerLength; i++) {
+      const sources = this.source.map(src => src[i]);
+      const data = srcFn(sources, i);
+      sources.forEach((src, j) => {
+        if (this.source[j] === undefined) this.source[j] = [];
+        this.source[j][i] = src;
+      });
+
+      if (transformFn !== undefined && this.cache[i] !== undefined) {
+        transformFn(this.cache[i], i, data);
+      }
     }
 
-    for (let i = 0; i < length; i++) {
+    if (transformFn === undefined) {
+      // TODO: should we actually allow this?
+      // Invalidating cache seems like far from the best solution because there
+      // might be references of Dest somewhere else as well.
+      this.cache.splice(0, this.cache.length);
+    }
+  }
+
+  *[Symbol.iterator]() {
+    // TODO: more efficient hole skipping
+    for (let i = 0; i < this.sourceInnerLength; i++) {
       const v = this.get(i);
       if (v === undefined) continue;
       yield v;
@@ -152,18 +191,6 @@ function assignRemap(
 
 ////////////////////////////////////////////////////////////////////////////////
 
-type BackrefEntry = {
-  outer: string;
-  inner: string;
-  key?: string;
-};
-
-type BackrefContainer = {
-  [k: string]: {
-    [l: string]: BackrefEntry;
-  };
-};
-
 export default class Dex {
   gens: Transformer<any, Generation>;
   species: GenFamilyStore<Species>;
@@ -171,8 +198,6 @@ export default class Dex {
   items: GenFamilyStore<Item>;
   moves: GenFamilyStore<Move>;
   types: GenFamilyStore<Type>;
-
-  private backrefs: BackrefContainer = {};
 
   constructor(dexSrc: any[]) {
     const genSrc: any[] = [];
@@ -192,28 +217,139 @@ export default class Dex {
 
   constructBackref(
     [firstOuter, firstInner, firstKey]: [string, string, string?],
-    [secondOuter, secondInner, secondKey = firstKey] = [firstInner, firstOuter]
+    [secondOuter, secondInner, secondKey] = [firstInner, firstOuter, firstKey]
   ): Dex {
-    if (!(firstOuter in this.backrefs)) this.backrefs[firstOuter] = {};
-    this.backrefs[firstOuter][firstInner] = {
-      outer: secondOuter,
-      inner: secondInner,
-      key: secondKey,
-    };
-
-    if (!(secondOuter in this.backrefs)) this.backrefs[secondOuter] = {};
-    this.backrefs[secondOuter][secondInner] = {
-      outer: firstOuter,
-      inner: firstInner,
-      key: firstKey,
-    };
-
+    generateBackrefs(
+      this,
+      [firstOuter, firstInner, firstKey],
+      [secondOuter, secondInner, secondKey]
+    );
     return this;
   }
+}
 
-  getBackref(outer: string, inner: string): BackrefEntry | undefined {
-    return this.backrefs[outer]?.[inner];
+////////////////////////////////////////////////////////////////////////////////
+
+// Backreffing
+
+function generateBackrefs(
+  dex: Dex,
+  [firstOuter, firstInner, firstKey]: [string, string, string?],
+  [secondOuter, secondInner, secondKey] = [firstInner, firstOuter, firstKey]
+) {
+  // Swap first and second if needed so that backref is always first -> second
+  // ASSUMPTION: our sources will always contain at least 1 delta
+  let ltr: boolean | undefined = undefined;
+  for (const gen of dex.gens) {
+    ltr =
+      firstOuter in gen &&
+      firstInner in
+        ((gen[firstOuter] as Transformer<any, GenerationalBase>).get(0)!
+          .constructor as typeof GenerationalBase).REMAP;
+    break;
   }
+  if (ltr === undefined) {
+    throw new Error(
+      `could not determine direction for backref ${firstOuter}.${firstInner} -> ${secondOuter}.${secondInner}`
+    );
+  }
+  if (!ltr) {
+    [firstOuter, firstInner, firstKey, secondOuter, secondInner, secondKey] = [
+      secondOuter,
+      secondInner,
+      secondKey,
+      firstOuter,
+      firstInner,
+      firstKey,
+    ];
+  }
+
+  // Perform backref
+  for (const gen of dex.gens) {
+    const transformer = gen[secondOuter] as Transformer<any, GenerationalBase>;
+    transformer.mapSource(
+      (delta, i) => {
+        const backrefData = getBackrefData(gen, i, firstOuter, firstInner, firstKey);
+        const obj = { [secondInner]: backrefData };
+
+        let found = false;
+        for (let i = 0, len = delta.length; i < len; i++) {
+          if (delta[i] === undefined) {
+            found = true;
+            delta[i] = obj;
+            break;
+          }
+        }
+        if (!found) delta.push(obj);
+
+        return backrefData;
+      },
+      (obj, _, data) => {
+        const sym = (obj.constructor as typeof GenerationalBase).REMAP[secondInner];
+        (obj as any)[sym] = data;
+      }
+    );
+  }
+}
+
+function getBackrefData(
+  gen: Generation,
+  id: number,
+  outer: string,
+  inner: string,
+  fromKey?: string,
+  toKey?: string
+) {
+  let sourceIdx: number | undefined;
+
+  const backrefs: any[] = [];
+  const addToBackrefs = (checkObj: any, checkAgainst: any, addObj: any) => {
+    if (typeof checkObj === 'number') {
+      if (checkObj === checkAgainst) backrefs.push(addObj);
+    } else if (isNumberArray(checkObj)) {
+      if (checkObj.includes(checkAgainst)) backrefs.push(addObj);
+    } else {
+      throw new Error(`invalid type for backref ${outer}.${inner}: ${typeof checkObj}`);
+    }
+  };
+
+  (gen[outer] as Transformer<any, GenerationalBase>).forEachIdInSource((source, newId) => {
+    if (sourceIdx === undefined) {
+      // Find in what source `inner` is
+      for (let i = 0, len = source.length; i < len; i++) {
+        if (inner in source[i]) {
+          sourceIdx = i;
+          break;
+        }
+      }
+
+      if (sourceIdx === undefined) {
+        throw new Error(`could not find ${outer}.${inner} in any source to backref`);
+      }
+    }
+
+    const backref = source[sourceIdx][inner];
+    if (fromKey === undefined) {
+      const newObj = toKey === undefined ? newId : { [toKey]: newId };
+      addToBackrefs(backref, id, newObj);
+    } else if (fromKey === undefined) {
+      if (toKey === undefined) {
+        addToBackrefs(backref[fromKey], id, newId);
+      } else {
+        // TODO: is shallow copy fine?
+        const newObj = Object.assign({}, backref);
+        delete newObj[fromKey];
+        newObj[toKey] = newId;
+        addToBackrefs(backref[fromKey], id, newObj);
+      }
+    }
+  });
+
+  return backrefs;
+}
+
+function isNumberArray(arr: any): arr is number[] {
+  return Array.isArray(arr) && (arr.length === 0 || typeof arr[0] === 'number');
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -286,121 +422,10 @@ class Generation {
 }
 
 class GenerationalBase {
+  static REMAP: { [key: string]: symbol } = {};
   [k: string]: unknown;
 
   constructor(public gen: Generation, public __id: number /* TODO: symbol? */) {}
-
-  protected *resolveBackref<T>(
-    backrefEntry: BackrefEntry,
-    key?: string
-  ): Generator<T, void> | undefined {
-    const { outer, inner } = backrefEntry;
-
-    const backref = this.gen.dex.getBackref(outer, inner);
-    if (backref === undefined) return undefined;
-    const { outer: backrefOuter, inner: backrefInner, key: backrefKey } = backref;
-
-    const type = this.gen[backrefOuter];
-    if (!(type instanceof Transformer)) {
-      throw new Error(
-        `backref ${outer}.${inner} -> ${backrefOuter}.${backrefInner} does not result in a Transformer`
-      );
-    }
-
-    const getKeyedObject = (obj: Record<string, any>) =>
-      backrefKey === undefined ? obj : obj[backrefKey];
-    const result = (type as Transformer<any, T>).filter(obj => {
-      const o = (obj as any)[backrefInner];
-      if (o === undefined) {
-        throw new Error(
-          `required key not found for backref ${outer}.${inner} -> ${backrefOuter}.${backrefInner}`
-        );
-      }
-
-      if (Array.isArray(o)) {
-        return o.some(v => (typeof v === 'number' ? v : getKeyedObject(v).__id) === this.__id);
-      }
-
-      return (typeof o === 'number' ? o : getKeyedObject(o).__id) === this.__id;
-    });
-
-    for (const obj of result) {
-      if (key === undefined) {
-        yield obj;
-        continue;
-      }
-
-      const newObj = Object.assign({}, obj) as any;
-      newObj[key] = obj;
-      yield newObj;
-    }
-  }
-
-  protected resolveToSymbolOrBackref<T>(
-    sym: symbol,
-    refType: string,
-    isArray: true,
-    key?: string,
-    backrefOuter?: string,
-    backrefInner?: string
-  ): T[];
-  protected resolveToSymbolOrBackref<T>(
-    sym: symbol,
-    refType: string,
-    isArray: false,
-    key?: string,
-    backrefOuter?: string,
-    backrefInner?: string
-  ): T | undefined;
-  protected resolveToSymbolOrBackref<T>(
-    sym: symbol,
-    refType: string,
-    isArray = true,
-    key?: string,
-    backrefOuter?: string,
-    backrefInner?: string
-  ): T | T[] | undefined {
-    // TODO: cache backref results and large objects
-
-    // We have to use `this as any` everywhere because TypeScript doesn't like
-    // using symbols as indexes.
-
-    const v = (this as any)[sym];
-
-    if (v === undefined) {
-      if (backrefOuter !== undefined && backrefInner !== undefined) {
-        const backref = this.resolveBackref<T>(
-          { outer: backrefOuter, inner: backrefInner, key },
-          key
-        );
-        if (backref !== undefined) {
-          if (isArray) return Array.from(backref);
-          return backref.next().value as T | undefined;
-        }
-      }
-
-      throw new Error(`${refType} not loaded yet`);
-    }
-
-    const getKeyedValue = (obj: Record<string, any>) => (key === undefined ? obj : obj[key]);
-    const getKeyedObject = (obj: Record<string, any>) => {
-      const newObj = Object.assign({}, obj) as any;
-      newObj[key!] = (this.gen[refType] as Transformer<any, T>).resolve(getKeyedValue(obj));
-      return newObj;
-    };
-
-    if (isArray) {
-      return (v as any[]).map(id => {
-        if (key === undefined) return (this.gen[refType] as Transformer<any, T>).resolve(id);
-        return getKeyedObject(id);
-      });
-    } else if (!isArray) {
-      if (key === undefined) return (this.gen[refType] as Transformer<any, T>).resolve(v);
-      return getKeyedObject(v);
-    }
-
-    return v;
-  }
 
   toString() {
     if (Object.getOwnPropertyDescriptor(this, 'name') !== undefined) {
@@ -490,26 +515,20 @@ class SpeciesBase extends GenerationalBase {
   }
 
   get types() {
-    const v = this.resolveToSymbolOrBackref<Type>(
-      typesSym,
-      'types',
-      true,
-      undefined,
-      'species',
-      'types'
-    );
-    return SlashArray.from(v);
+    const v = this[typesSym];
+    if (v === undefined) throw new Error('types not loaded yet');
+    const typeArray = new SlashArray();
+    for (const id of v) {
+      typeArray.push(this.gen.types.resolve(id));
+    }
+    return typeArray;
   }
 
   get learnset() {
-    return this.resolveToSymbolOrBackref<{ what: Move; how: unknown }>(
-      learnsetSym,
-      'moves',
-      true,
-      'what',
-      'species',
-      'learnset'
-    );
+    const v = this[learnsetSym];
+    if (v === undefined) throw new Error('learnset not loaded yet');
+    // TODO: cache this? make it a Transformer? this is a big attribute
+    return v.map(({ what: id, how }) => ({ what: this.gen.moves.resolve(id), how }));
   }
 
   get altBattleFormes() {
@@ -520,23 +539,19 @@ class SpeciesBase extends GenerationalBase {
 }
 
 class Species extends SpeciesBase {
+  static REMAP = {
+    prevo: prevoSym,
+    evos: evosSym,
+    abilities: abilitiesSym,
+    types: typesSym,
+    learnset: learnsetSym,
+    altBattleFormes: altBattleFormesSym,
+  };
   [k: string]: unknown;
 
   constructor(gen: Generation, id: number, specie: Source<any>) {
     super(gen, id);
-    assignRemap(
-      {
-        prevo: prevoSym,
-        evos: evosSym,
-        abilities: abilitiesSym,
-        types: typesSym,
-        learnset: learnsetSym,
-        altBattleFormes: altBattleFormesSym,
-      },
-      this,
-      id,
-      specie
-    );
+    assignRemap((this.constructor as typeof Species).REMAP, this, id, specie);
   }
 }
 
@@ -551,7 +566,7 @@ class Ability extends GenerationalBase {
 
   constructor(gen: Generation, id: number, ability: Source<any>) {
     super(gen, id);
-    assignRemap({}, this, id, ability);
+    assignRemap((this.constructor as typeof Ability).REMAP, this, id, ability);
   }
 }
 
@@ -566,7 +581,7 @@ class Item extends GenerationalBase {
 
   constructor(gen: Generation, id: number, item: Source<any>) {
     super(gen, id);
-    assignRemap({}, this, id, item);
+    assignRemap((this.constructor as typeof Item).REMAP, this, id, item);
   }
 }
 
@@ -577,34 +592,36 @@ const speciesSym = Symbol();
 
 class MoveBase extends GenerationalBase {
   private [typeSym]: number | undefined;
-  private [speciesSym]: number[] | undefined;
+  private [speciesSym]: Array<{ what: number; how: unknown }> | undefined;
 
   get genFamily() {
     return makeGenFamily(this, 'moves');
   }
 
   get type() {
-    return this.resolveToSymbolOrBackref<Type>(typeSym, 'types', false, undefined, 'moves', 'type');
+    const v = this[typeSym];
+    if (v === undefined) throw new Error('type not loaded yet');
+    return this.gen.types.resolve(v);
   }
 
   get species() {
-    return this.resolveToSymbolOrBackref<Species>(
-      speciesSym,
-      'species',
-      true,
-      'what',
-      'moves',
-      'species'
-    );
+    const v = this[speciesSym];
+    if (v === undefined) throw new Error('learnset not loaded yet');
+    // TODO: cache this? make it a Transformer? this is a big attribute
+    return v.map(({ what: id, how }) => ({ what: this.gen.species.resolve(id), how }));
   }
 }
 
 class Move extends MoveBase {
+  static REMAP = {
+    type: typeSym,
+    species: speciesSym,
+  };
   [k: string]: unknown;
 
   constructor(gen: Generation, id: number, move: Source<any>) {
     super(gen, id);
-    assignRemap({ type: typeSym }, this, id, move);
+    assignRemap((this.constructor as typeof Move).REMAP, this, id, move);
   }
 }
 
@@ -613,6 +630,10 @@ class Move extends MoveBase {
 const movesSym = Symbol();
 
 class Type extends GenerationalBase {
+  static REMAP = {
+    species: speciesSym,
+    moves: movesSym,
+  };
   [speciesSym]: number[] | undefined;
   [movesSym]: number[] | undefined;
   [k: string]: unknown;
@@ -622,22 +643,21 @@ class Type extends GenerationalBase {
   }
 
   get species() {
-    return this.resolveToSymbolOrBackref(
-      speciesSym,
-      'species',
-      true,
-      undefined,
-      'types',
-      'species'
-    );
+    const v = this[speciesSym];
+    if (v === undefined) throw new Error('learnset not loaded yet');
+    // TODO: cache this? make it a Transformer? this is a big attribute
+    return v.map(id => this.gen.species.resolve(id));
   }
 
   get moves() {
-    return this.resolveToSymbolOrBackref(movesSym, 'moves', true, undefined, 'types', 'moves');
+    const v = this[movesSym];
+    if (v === undefined) throw new Error('learnset not loaded yet');
+    // TODO: cache this? make it a Transformer? this is a big attribute
+    return v.map(id => this.gen.moves.resolve(id));
   }
 
   constructor(gen: Generation, id: number, type: Source<any>) {
     super(gen, id);
-    assignRemap({}, this, id, type);
+    assignRemap((this.constructor as typeof Type).REMAP, this, id, type);
   }
 }
